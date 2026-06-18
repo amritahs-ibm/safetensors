@@ -1586,6 +1586,7 @@ impl Open {
                 offset: self.offset,
                 device: self.device.clone(),
                 storage: self.storage.clone(),
+                name: name.to_string(),
             })
         } else {
             Err(SafetensorError::new_err(format!(
@@ -1744,6 +1745,9 @@ struct PySafeSlice {
     offset: usize,
     device: Device,
     storage: Arc<Storage>,
+    /// Tensor key in the safetensors file.  Forwarded to the custom-device
+    /// hook so it receives the same name as Open::get_tensor() would pass.
+    name: String,
 }
 
 use std::fmt;
@@ -1885,6 +1889,79 @@ impl PySafeSlice {
             mps_tensor_from_buf(py, &self.framework, self.info.dtype, &newshape, buf)
         })
     }
+
+    /// Slice the tensor and transfer the result to a custom device via the
+    /// registered hook.
+    ///
+    /// Called by `__getitem__` whenever `self.device` is `Device::Custom`.
+    ///
+    /// # Strategy
+    ///
+    /// 1. Gather the post-slice bytes into a contiguous CPU buffer using
+    ///    `slice_bytes_to_tensor` -- the same helper used by the mmap/pread
+    ///    branches of `__getitem__`.  For mmap storage only the slice ranges
+    ///    are copied, not the whole tensor.
+    ///
+    /// 2. Call `hook(cpu_tensor, name, device)` to move the CPU tensor to
+    ///    the custom device -- exactly as `Open::get_tensor` does.
+    ///
+    /// Torch / Paddle storage is never created for custom devices because
+    /// `Open::new` skips the `UntypedStorage` construction path for
+    /// `Device::Custom`, so those arms are unreachable in practice.
+    fn slice_custom_device(&self, slices: &PyBound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        // Step 1 -- produce a contiguous CPU tensor for the requested slice.
+        let cpu_tensor: Py<PyAny> = match self.storage.as_ref() {
+            Storage::Mmap(mmap) => {
+                let data = &mmap[self.info.data_offsets.0 + self.offset
+                    ..self.info.data_offsets.1 + self.offset];
+                self.slice_bytes_to_tensor(slices, data)?
+            }
+            Storage::Pread(file) => {
+                let (begin, end) = self.info.data_offsets;
+                let nbytes = end - begin;
+                let mut data = vec![0u8; nbytes];
+                if nbytes > 0 {
+                    read_exact_at(file, &mut data, (self.offset + begin) as u64).map_err(
+                        |e| {
+                            SafetensorError::new_err(format!(
+                                "Could not read tensor bytes for slicing: {e}"
+                            ))
+                        },
+                    )?;
+                }
+                self.slice_bytes_to_tensor(slices, &data)?
+            }
+            // Unreachable: Open::new skips UntypedStorage construction for
+            // Device::Custom so Storage::Torch / Storage::Paddle are never
+            // created for custom devices.  Emit a clear error anyway.
+            Storage::Torch(_) | Storage::Paddle(_) => {
+                return Err(SafetensorError::new_err(
+                    "Custom device slicing with Torch/Paddle storage is not supported. \
+                     Use backend='pread' or open the file without a custom device.",
+                ));
+            }
+        };
+
+        // Step 2 -- invoke the registered hook to move the CPU tensor to the
+        // custom device.  The hook signature is (cpu_tensor, name, device).
+        let Device::Custom(device_type, _) = &self.device else {
+            unreachable!("slice_custom_device called for non-Custom device")
+        };
+        let hooks = DEVICE_HOOKS.read().unwrap();
+        let hook = hooks.get(device_type).ok_or_else(|| {
+           SafetensorError::new_err(format!(
+               "safetensors: device type '{device_type}' is not natively supported \
+                and no transfer hook has been registered for it. \
+                If you are using a third-party device package, make sure it is \
+                imported before calling safe_open (e.g., 'import torch_{device_type}')."
+           ))
+        })?;
+        Python::attach(|py| {
+            let device_obj: Py<PyAny> = self.device.clone().into_pyobject(py)?.into();
+            hook(cpu_tensor, &self.name, device_obj)
+        })
+    }
+
 }
 
 #[pymethods]
@@ -1930,6 +2007,14 @@ impl PySafeSlice {
     }
 
     pub fn __getitem__(&self, slices: &PyBound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        // Custom device: gather the sliced bytes on CPU then dispatch to the
+        // registered hook.  Must come before the MPS guard because a custom
+        // device could in principle run on macOS/aarch64 and the MPS path
+        // would otherwise shadow it.
+        if matches!(self.device, Device::Custom(_, _)) {
+            return self.slice_custom_device(slices);
+        }
+
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if self.device == Device::Mps
             && self.framework == Framework::Pytorch
